@@ -10,12 +10,13 @@ import asyncio
 TOKEN = os.getenv("TOKEN")
 
 # ⚠️ ЗАМЕНИ ЭТИ ID НА СВОИ ⚠️
-APPLY_CHANNEL_ID = 123456789012345678   # канал, куда бот САМ напишет сообщение с кнопкой
-LOG_CHANNEL_ID = 123456789012345678     # канал для логов заявок (только стафф)
+GUILD_ID = 123456789012345678           # ID твоего сервера ← ВАЖНО!
+APPLY_CHANNEL_ID = 123456789012345678   # канал с кнопкой "Заявка"
+LOG_CHANNEL_ID = 123456789012345678     # канал для логов заявок
 MAIN_ROLE_ID = 123456789012345678       # роль Main
 FAMILY_ROLE_ID = 123456789012345678     # роль Family
 
-# 🛡️ СТАФФ-РОЛИ — сколько нужно
+# 🛡️ СТАФФ-РОЛИ
 STAFF_ROLES = [
     123456789012345678,
     987654321098765432,
@@ -50,6 +51,11 @@ def is_staff(member: discord.Member) -> bool:
     return bool(user_role_ids & set(STAFF_ROLES))
 
 
+def get_our_guild() -> discord.Guild | None:
+    """Возвращает объект нашего сервера по GUILD_ID."""
+    return bot.get_guild(GUILD_ID)
+
+
 # ================== ФОРМА ЗАЯВКИ ==================
 class ApplicationModal(discord.ui.Modal):
     def __init__(self, team: str):
@@ -80,6 +86,13 @@ class ApplicationModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+
+        # 🛡️ проверяем, что заявка подаётся ИМЕННО на нашем сервере
+        if interaction.guild is None or interaction.guild.id != GUILD_ID:
+            await interaction.followup.send(
+                "❌ Заявки принимаются только на основном сервере.", ephemeral=True
+            )
+            return
 
         log_channel = bot.get_channel(LOG_CHANNEL_ID)
         if log_channel is None:
@@ -140,6 +153,13 @@ class ReviewView(discord.ui.View):
         self.team = team
 
     async def _check_staff(self, interaction: discord.Interaction) -> bool:
+        # 🛡️ проверяем, что кнопку жмёт стафф ИМЕННО нашего сервера
+        if interaction.guild is None or interaction.guild.id != GUILD_ID:
+            await interaction.response.send_message(
+                "❌ Действие доступно только на основном сервере.", ephemeral=True
+            )
+            return False
+
         if not is_staff(interaction.user):
             await interaction.response.send_message(
                 "❌ Только стафф может это делать.", ephemeral=True
@@ -159,7 +179,8 @@ class ReviewView(discord.ui.View):
             )
             return
 
-        guild = interaction.guild
+        # 🛡️ берём ИМЕННО наш сервер по GUILD_ID
+        guild = get_our_guild() or interaction.guild
         member = guild.get_member(self.applicant_id)
         role_id = MAIN_ROLE_ID if "Main" in self.team else FAMILY_ROLE_ID
         role = guild.get_role(role_id)
@@ -209,7 +230,8 @@ class ReviewView(discord.ui.View):
             )
             return
 
-        guild = interaction.guild
+        # 🛡️ берём ИМЕННО наш сервер по GUILD_ID
+        guild = get_our_guild() or interaction.guild
         member = guild.get_member(self.applicant_id)
 
         embed = interaction.message.embeds[0]
@@ -264,6 +286,12 @@ class ApplyView(discord.ui.View):
         custom_id="apply_button"
     )
     async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 🛡️ защита от использования на чужом сервере
+        if interaction.guild is None or interaction.guild.id != GUILD_ID:
+            await interaction.response.send_message(
+                "❌ Заявки доступны только на основном сервере.", ephemeral=True
+            )
+            return
         await interaction.response.send_message(
             "🎯 Выбери отряд, в который хочешь подать заявку:",
             view=TeamSelectView(),
@@ -271,16 +299,26 @@ class ApplyView(discord.ui.View):
         )
 
 
-# ================== АВТО-ОТПРАВКА СООБЩЕНИЯ В КАНАЛ ==================
+# ================== АВТО-ОТПРАВКА СООБЩЕНИЯ ==================
 async def send_apply_message():
-    """Отправляет сообщение с кнопкой в APPLY_CHANNEL_ID при запуске бота."""
+    """Отправляет сообщение с кнопкой в APPLY_CHANNEL_ID при запуске."""
     await bot.wait_until_ready()
-    channel = bot.get_channel(APPLY_CHANNEL_ID)
-    if channel is None:
-        print(f"❌ Канал APPLY_CHANNEL_ID={APPLY_CHANNEL_ID} не найден")
+
+    # 🛡️ проверяем, что бот вообще видит наш сервер
+    guild = get_our_guild()
+    if guild is None:
+        print(f"❌ Бот не видит сервер GUILD_ID={GUILD_ID}. "
+              f"Проверь, что бот приглашён именно на этот сервер.")
         return
 
-    # удаляем старые сообщения бота в этом канале с кнопкой "Заявка"
+    print(f"✅ Найден сервер: {guild.name} (id={guild.id})")
+
+    channel = guild.get_channel(APPLY_CHANNEL_ID) or bot.get_channel(APPLY_CHANNEL_ID)
+    if channel is None:
+        print(f"❌ Канал APPLY_CHANNEL_ID={APPLY_CHANNEL_ID} не найден на сервере {guild.name}")
+        return
+
+    # удаляем старые сообщения бота с кнопкой
     try:
         async for msg in channel.history(limit=50):
             if msg.author.id == bot.user.id and msg.components:
@@ -303,7 +341,7 @@ async def send_apply_message():
 
     try:
         await channel.send(embed=embed, view=ApplyView())
-        print(f"✅ Сообщение с набором отправлено в канал {channel.name}")
+        print(f"✅ Сообщение с набором отправлено в канал #{channel.name}")
     except Exception as e:
         print(f"❌ Не удалось отправить сообщение: {e}")
 
@@ -316,7 +354,7 @@ async def on_ready():
     asyncio.create_task(send_apply_message())
 
 
-# ================== ВЕБ-СЕРВЕР ДЛЯ RENDER ==================
+# ================== ВЕБ-СЕРВЕР ==================
 async def healthcheck(request):
     return web.Response(text="Bot is alive!")
 
