@@ -4,16 +4,30 @@ from discord import app_commands
 import json
 import os
 from datetime import datetime
+from aiohttp import web
+import asyncio
 
 # ================== НАСТРОЙКИ ==================
-TOKEN = os.getenv("TOKEN")  # берём из переменных окружения Render
+TOKEN = os.getenv("TOKEN")  # токен из Environment Variables на Render
 
-APPLY_CHANNEL_ID = 123456789012345678
-LOG_CHANNEL_ID = 123456789012345678
-STAFF_ROLE_ID = 123456789012345678
-MAIN_ROLE_ID = 123456789012345678
-FAMILY_ROLE_ID = 123456789012345678
-GUILD_ID = 123456789012345678
+# ⚠️ ЗАМЕНИ ЭТИ ID НА СВОИ ⚠️
+APPLY_CHANNEL_ID = 123456789012345678   # канал с кнопкой "Заявка"
+LOG_CHANNEL_ID = 123456789012345678     # канал для логов (только стафф)
+MAIN_ROLE_ID = 123456789012345678       # роль Main (выдаётся при принятии)
+FAMILY_ROLE_ID = 123456789012345678     # роль Family (выдаётся при принятии)
+GUILD_ID = 123456789012345678           # ID твоего сервера
+
+# 🛡️ СТАФФ-РОЛИ — можно указать сколько угодно
+# Вариант 1 (по умолчанию): задай список прямо тут
+STAFF_ROLES = [
+    123456789012345678,   # роль стаффа №1 — замени
+    987654321098765432,   # роль стаффа №2 — замени (если не нужна — удали строку)
+]
+
+# Вариант 2 (гибкий): если задана env-переменная STAFF_ROLES — используется она
+_env_staff = os.getenv("STAFF_ROLES")
+if _env_staff:
+    STAFF_ROLES = [int(x.strip()) for x in _env_staff.split(",") if x.strip()]
 # ===============================================
 
 intents = discord.Intents.default()
@@ -24,6 +38,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 DATA_FILE = "applications.json"
 
 
+# ---------- хранилище заявок ----------
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -36,7 +51,13 @@ def save_data(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ================== ФОРМА ЗАЯВКИ ==================
+# ---------- проверка: является ли юзер стаффом ----------
+def is_staff(member: discord.Member) -> bool:
+    user_role_ids = {r.id for r in member.roles}
+    return bool(user_role_ids & set(STAFF_ROLES))
+
+
+# ================== ФОРМА ЗАЯВКИ (3 ВОПРОСА) ==================
 class ApplicationModal(discord.ui.Modal):
     def __init__(self, team: str):
         super().__init__(title=f"Заявка в {team}")
@@ -89,7 +110,10 @@ class ApplicationModal(discord.ui.Modal):
         embed.set_footer(text="Заявка ожидает решения стаффа")
 
         view = ReviewView(app_id=app_id, applicant_id=interaction.user.id, team=self.team)
-        msg = await log_channel.send(content=f"<@&{STAFF_ROLE_ID}>", embed=embed, view=view)
+
+        # пингуем ВСЕ стафф-роли
+        staff_pings = " ".join(f"<@&{rid}>" for rid in STAFF_ROLES)
+        msg = await log_channel.send(content=staff_pings or None, embed=embed, view=view)
 
         data = load_data()
         data[app_id] = {
@@ -109,7 +133,7 @@ class ApplicationModal(discord.ui.Modal):
         )
 
 
-# ================== ПРИНЯТЬ / ОТКЛОНИТЬ ==================
+# ================== КНОПКИ ПРИНЯТЬ / ОТКЛОНИТЬ ==================
 class ReviewView(discord.ui.View):
     def __init__(self, app_id: str, applicant_id: int, team: str):
         super().__init__(timeout=None)
@@ -118,7 +142,7 @@ class ReviewView(discord.ui.View):
         self.team = team
 
     async def _check_staff(self, interaction: discord.Interaction) -> bool:
-        if STAFF_ROLE_ID not in [r.id for r in interaction.user.roles]:
+        if not is_staff(interaction.user):
             await interaction.response.send_message("❌ Только стафф может это делать.", ephemeral=True)
             return False
         return True
@@ -147,7 +171,11 @@ class ReviewView(discord.ui.View):
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.green()
         embed.set_footer(text=f"✅ Принято стаффом: {interaction.user}")
-        embed.add_field(name="📊 Решение", value=f"**Принято** ✅\nСтафф: {interaction.user.mention}", inline=False)
+        embed.add_field(
+            name="📊 Решение",
+            value=f"**Принято** ✅\nСтафф: {interaction.user.mention}",
+            inline=False
+        )
 
         for child in self.children:
             child.disabled = True
@@ -183,7 +211,11 @@ class ReviewView(discord.ui.View):
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.red()
         embed.set_footer(text=f"❌ Отклонено стаффом: {interaction.user}")
-        embed.add_field(name="📊 Решение", value=f"**Отклонено** ❌\nСтафф: {interaction.user.mention}", inline=False)
+        embed.add_field(
+            name="📊 Решение",
+            value=f"**Отклонено** ❌\nСтафф: {interaction.user.mention}",
+            inline=False
+        )
 
         for child in self.children:
             child.disabled = True
@@ -217,7 +249,7 @@ class TeamSelectView(discord.ui.View):
         await interaction.response.send_modal(ApplicationModal(team="Family"))
 
 
-# ================== ГЛАВНАЯ КНОПКА ==================
+# ================== ГЛАВНАЯ КНОПКА "ЗАЯВКА" ==================
 class ApplyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -231,10 +263,11 @@ class ApplyView(discord.ui.View):
         )
 
 
-# ================== СОБЫТИЯ И КОМАНДЫ ==================
+# ================== СОБЫТИЯ ==================
 @bot.event
 async def on_ready():
     print(f"✅ Бот запущен как {bot.user}")
+    print(f"🛡️ Стафф-роли: {STAFF_ROLES}")
     try:
         bot.add_view(ApplyView())
         synced = await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
@@ -243,12 +276,13 @@ async def on_ready():
         print(f"Ошибка синхронизации: {e}")
 
 
+# ================== КОМАНДЫ ==================
 @bot.tree.command(name="setup_apply", description="Отправить сообщение с набором в клан", guild=discord.Object(id=GUILD_ID))
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_apply(interaction: discord.Interaction):
     channel = bot.get_channel(APPLY_CHANNEL_ID)
     if channel is None:
-        await interaction.response.send_message("❌ Канал не найден.", ephemeral=True)
+        await interaction.response.send_message("❌ Канал не найден. Проверь APPLY_CHANNEL_ID.", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -286,11 +320,7 @@ async def on_app_command_error(interaction: discord.Interaction, error):
         await interaction.response.send_message("❌ Нет прав.", ephemeral=True)
 
 
-# ================== ЗАПУСК С ВЕБ-СЕРВЕРОМ ДЛЯ RENDER ==================
-from aiohttp import web
-import asyncio
-
-
+# ================== ВЕБ-СЕРВЕР ДЛЯ RENDER ==================
 async def healthcheck(request):
     return web.Response(text="Bot is alive!")
 
